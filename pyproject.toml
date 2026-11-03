@@ -20,6 +20,7 @@ dependencies = [
     "appdirs>=1.4",
     "keyring>=21.0",
     "pillow>=10.0",
+    "pillow-heif>=0.18",
     "pyyaml>=5.0",
     "requests>=2.0",
     "rich>=12.3.0",

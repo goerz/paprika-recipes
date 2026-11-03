@@ -31,6 +31,7 @@ class FakeAccount:
         self.index_requests = 0
         self.photo_downloads = 0
         self.url_refreshes = 0
+        self.gallery_url_requests = 0
         self.edits = 0
 
         for recipe in recipes:
@@ -62,9 +63,17 @@ class FakeAccount:
 
         return self.recipes[uid].get("photo_url") or ""
 
+    def gallery_photo_url(self, uid: str) -> str:
+        self.gallery_url_requests += 1
+
+        return self.gallery[uid].photo_url or ""
+
     def upload_recipe(
         self, recipe: RemoteRecipe, photo_upload: bytes | None = None
     ) -> RemoteRecipe:
+        # The gallery is not part of a recipe's JSON; the real upload drops it.
+        recipe = replace(recipe, gallery=[])
+
         if photo_upload is not None:
             # The server stores the image and hands back a signed link to it.
             url = f"https://photos.example/{recipe.photo}"
@@ -136,6 +145,8 @@ class FakeAccount:
         large = f"{uid}-large-{version}"
 
         self.photos[url] = data
+        # The gallery holds the picture itself; the fake stores the same bytes.
+        self.photos[f"https://photos.example/{large}.jpg"] = data
         self.gallery[large] = RemotePhoto(
             uid=large,
             recipe_uid=uid,
@@ -214,7 +225,7 @@ def delete_embed(repository: Repository, uid: str) -> None:
         "\n".join(
             line
             for line in path.read_text(encoding="utf-8").split("\n")
-            if not line.startswith("![")
+            if not line.startswith(("![", "[!["))
         ),
         encoding="utf-8",
     )
@@ -1000,7 +1011,8 @@ class TestPhotosComeDownWithAPull:
 
         Syncer(repository, account).pull()
 
-        assert account.photo_downloads == 1
+        # One thumbnail and one gallery photo, and nothing the second time.
+        assert account.photo_downloads == 2
 
     def test_an_attachment_tidied_away_by_hand_is_healed(self, repository, account):
         """A vault user pruning "unused" files must not break the embed forever."""
@@ -1083,7 +1095,10 @@ class TestPhotosComeDownWithAPull:
 
         report = Syncer(repository, account).pull()
 
-        assert actions(report)["Recipe A"] is Action.ADDED
+        assert [change.name for change in report.of(Action.ADDED)] == [
+            "Recipe A",
+            "Recipe B",
+        ]
         (skipped,) = report.of(Action.SKIPPED)
         assert "could not be downloaded" in skipped.detail
         assert sorted(repository.paths_by_uid()) == ["A", "B"]
@@ -1144,10 +1159,17 @@ class TestPushingANewPhoto:
 
         stored = account.recipes["A"]
         assert not (repository.attachments_dir / "dinner.jpg").exists()
-        assert (repository.attachments_dir / stored["photo"]).read_bytes() == data
+        # What is left is exactly what Paprika holds: its thumbnail, and the
+        # full-size picture in the gallery.
+        thumbnail = account.photos[f"https://photos.example/{stored['photo']}"]
+        assert (repository.attachments_dir / stored["photo"]).read_bytes() == thumbnail
+        assert (repository.attachments_dir / stored["photo_large"]).read_bytes() == data
 
         content = repository.paths_by_uid()["A"].read_text(encoding="utf-8")
-        assert f"](attachments/{stored['photo']})" in content
+        assert (
+            f"(attachments/{stored['photo']})](attachments/{stored['photo_large']})"
+            in content
+        )
         assert "dinner.jpg" not in content
 
     def test_says_what_happened_to_the_file(self, repository, account):
@@ -1242,16 +1264,19 @@ class TestPushingAPhotoRemoval:
             report.of(Action.UPLOADED)[0].detail
         )
 
-    def test_takes_the_gallery_twin_down_with_it(self, repository, account):
+    def test_leaves_the_gallery_alone(self, repository, account):
+        """The gallery has its own section; only removing a line there
+        removes a gallery photo."""
         account.give_photo("A")
         Syncer(repository, account).pull()
         delete_embed(repository, "A")
 
         Syncer(repository, account).push()
 
-        assert account.gallery["A-large-1"].deleted
+        assert not account.gallery["A-large-1"].deleted
+        assert (repository.attachments_dir / "A-large-1.jpg").exists()
 
-    def test_removes_the_attachment_and_its_state(self, repository, account):
+    def test_removes_the_thumbnail(self, repository, account):
         account.give_photo("A")
         Syncer(repository, account).pull()
         delete_embed(repository, "A")
@@ -1259,7 +1284,9 @@ class TestPushingAPhotoRemoval:
         Syncer(repository, account).push()
 
         assert not (repository.attachments_dir / "A-1.jpg").exists()
-        assert repository.read_photo_state("A") is None
+        state = repository.read_photo_state("A")
+        assert state is not None
+        assert state.photo == ""
 
     def test_the_next_sync_has_nothing_to_say(self, repository, account):
         account.give_photo("A")
@@ -1316,20 +1343,18 @@ class TestReplacingAPhoto:
         stored = account.recipes["A"]
         assert stored["photo"] != "A-1.jpg"
         assert not (repository.attachments_dir / "A-1.jpg").exists()
-        assert (repository.attachments_dir / stored["photo"]).read_bytes() == data
+        assert (repository.attachments_dir / stored["photo_large"]).read_bytes() == data
 
-    def test_the_old_gallery_twin_is_taken_down(self, repository, account):
+    def test_the_old_gallery_photo_stays(self, repository, account):
         account.give_photo("A", image_bytes("blue"))
         Syncer(repository, account).pull()
         (repository.attachments_dir / "A-1.jpg").write_bytes(image_bytes("green"))
 
         Syncer(repository, account).push()
 
-        assert account.gallery["A-large-1"].deleted
-        assert any(
-            photo.recipe_uid == "A" and not photo.deleted
-            for photo in account.gallery.values()
-        )
+        assert not account.gallery["A-large-1"].deleted
+        assert account.recipes["A"]["photo_large"] != "A-large-1.jpg"
+        assert sum(photo.recipe_uid == "A" for photo in account.gallery.values()) == 2
 
     def test_an_embed_pointed_at_a_different_file(self, repository, account):
         account.give_photo("A", image_bytes("blue"))
@@ -1343,7 +1368,7 @@ class TestReplacingAPhoto:
 
         assert actions(report)["Recipe A"] is Action.UPLOADED
         stored = account.recipes["A"]
-        assert (repository.attachments_dir / stored["photo"]).read_bytes() == data
+        assert (repository.attachments_dir / stored["photo_large"]).read_bytes() == data
         assert not (repository.attachments_dir / "better.jpg").exists()
         assert not (repository.attachments_dir / "A-1.jpg").exists()
 

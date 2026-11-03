@@ -23,6 +23,10 @@ class RemoteRecipe(BaseRecipe):
     on_grocery_list: str | None = None
     photo_url: str | None = None
     scale: str | None = None
+    #: The recipe's photo gallery as `[filename, caption]` pairs, in order.
+    #: Not part of the recipe's JSON on the server: `Syncer` fills it in from
+    #: the photo endpoint, and it is never uploaded with the recipe.
+    gallery: list[list[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -214,6 +218,16 @@ class Remote(RecipeManager):
 
         return CategoryNames.from_api(response.json().get("result") or [])
 
+    def gallery_photo_url(self, uid: str) -> str:
+        """A freshly signed download link for one gallery photo.
+
+        The gallery listing names each photo but carries no link to it; only
+        asking for the photo itself does, signed for a few hours.
+        """
+        response = self._request("get", f"/api/v2/sync/photo/{uid}/")
+
+        return (response.json().get("result") or {}).get("photo_url") or ""
+
     def add_recipe(self, recipe: RemoteRecipe) -> RemoteRecipe:
         return self.upload_recipe(recipe)
 
@@ -298,6 +312,7 @@ def _recipe_upload(recipe: RemoteRecipe) -> bytes:
     """
     data = recipe.as_dict()
     data.pop("photo_url", None)
+    data.pop("gallery", None)
 
     for name in ("photo", "photo_hash", "photo_large"):
         data[name] = data[name] or None

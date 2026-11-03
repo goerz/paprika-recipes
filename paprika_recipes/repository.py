@@ -52,6 +52,7 @@ from .exceptions import PaprikaProgrammingError, PaprikaUserError
 from .ignore import IGNORE_FILENAME, IgnoreRules
 from .markdown import (
     ATTACHMENTS_DIRNAME,
+    GALLERY_FIELD,
     PHOTO_FIELD,
     DocumentFormat,
     Extras,
@@ -102,6 +103,9 @@ class WorkingRecipe:
     #: in place.  Invisible to a text comparison of the file, so it is
     #: detected separately; see `Repository._photo_replaced`.
     photo_replaced: bool = False
+    #: Gallery files whose bytes the user swapped out in place, by filename;
+    #: the gallery's counterpart of `photo_replaced`.
+    gallery_replaced: frozenset[str] = frozenset()
 
     @property
     def name(self) -> str:
@@ -132,6 +136,9 @@ class WorkingRecipe:
         if self.photo_replaced:
             # The embed reads the same, but the image behind it does not.
             changed.add(PHOTO_FIELD)
+
+        if self.gallery_replaced:
+            changed.add(GALLERY_FIELD)
 
         return sorted(changed)
 
@@ -167,23 +174,60 @@ class WorkingRecipe:
 
 
 @dataclass(frozen=True)
+class GalleryPhotoState:
+    """What we know about one gallery photo we wrote into `attachments/`.
+
+    Everything but `content_hash` is the server's record of the photo, kept
+    so that a push can address it (`uid`) and tell what changed (`name`,
+    `order_flag`, `hash`).  `content_hash` digests the bytes we wrote, which
+    is how a file the user replaced in place is noticed.
+    """
+
+    uid: str = ""
+    name: str = ""
+    order_flag: int = 0
+    hash: str = ""
+    content_hash: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> GalleryPhotoState:
+        return cls(
+            uid=str(data.get("uid", "")),
+            name=str(data.get("name", "") or ""),
+            order_flag=int(data.get("order_flag", 0) or 0),
+            hash=str(data.get("hash", "") or ""),
+            content_hash=str(data.get("content_hash", "")),
+        )
+
+
+@dataclass(frozen=True)
 class PhotoState:
-    """What we know about the photo we last wrote into `attachments/`.
+    """What we know about a recipe's photos as we last wrote them.
 
-    `photo` and `photo_hash` are the server's: the filename the recipe points
-    at and the token that says which version of the image it is.  Together
+    `photo` and `photo_hash` are the server's: the filename of the recipe's
+    thumbnail and the token that says which version of it that is.  Together
     they are what lets a pull decide whether the attachment on disk is
-    already the photo the server holds.
+    already the thumbnail the server holds.  `content_hash` is ours: a digest
+    of the thumbnail bytes we wrote.
 
-    `content_hash` is ours: a digest of the bytes we actually wrote.  Nothing
-    reads it yet -- it is recorded now so that, once photos can be edited
-    locally, an attachment the user replaced can be told apart from the one
-    we downloaded.
+    `gallery` records every gallery photo we mirrored, by filename, and
+    `large` names the one among them that is the recipe's own full-size
+    photo -- the file the embed beneath the title shows.
     """
 
     photo: str = ""
     photo_hash: str = ""
     content_hash: str = ""
+    large: str = ""
+    gallery: dict[str, GalleryPhotoState] = field(default_factory=dict)
+
+    def displayed(self) -> tuple[str, str]:
+        """The full-size file the photo embed links to (else the thumbnail),
+        and the digest of its bytes."""
+        if self.large and self.large in self.gallery:
+            return self.large, self.gallery[self.large].content_hash
+
+        return self.photo, self.content_hash
 
 
 @dataclass
@@ -310,10 +354,34 @@ class Repository:
         """How this directory's files are spelled; see `DocumentFormat`."""
         if self._format is None:
             self._format = DocumentFormat(
-                self.config.frontmatter_prefix, self.categories
+                self.config.frontmatter_prefix,
+                self.categories,
+                self.photo_links(),
             )
 
         return self._format
+
+    def photo_links(self) -> dict[str, str]:
+        """Each recipe's thumbnail, mapped to the full-size file it links to.
+
+        Only a full-size copy we actually wrote counts: a link must point at
+        a file that is there, so a recipe whose gallery copy could not be
+        downloaded shows its thumbnail without one.
+        """
+        aliases = {}
+
+        for uid in self._photo_state_uids():
+            state = self.read_photo_state(uid)
+
+            if state is None or not state.photo:
+                continue
+
+            shown, _ = state.displayed()
+
+            if shown != state.photo:
+                aliases[state.photo] = shown
+
+        return aliases
 
     @property
     def categories(self) -> CategoryNames:
@@ -325,17 +393,35 @@ class Repository:
 
         Recipes hold category uids, and only their files spell them as
         names, so a category renamed in the app changes nothing about any
-        recipe -- but every file naming it is now spelled wrong.  Left alone,
-        each would read back with a name we no longer know, and so look like
-        an edit.  Those files are rewritten here, spelling for spelling, before
-        anything else reads them: each one is read with the names it was
-        written with and written back with the new ones, so the recipe it
-        holds, local edits and all, is exactly what it was.
+        recipe -- but every file naming it is now spelled wrong.  See
+        `respell` for how those files are put right.
         """
         old = self.format
-        new = replace(old, categories=categories)
 
         if old.categories == categories:
+            return []
+
+        categories.save(self.categories_path)
+        self._format = None
+
+        return self.respell(old)
+
+    def respell(self, old: DocumentFormat) -> list[Path]:
+        """Rewrite files written in `old` spelling; return the files rewritten.
+
+        Some of what a file says is spelling rather than substance: category
+        names stand for uids, and the photo embed shows a full-size file in
+        place of the thumbnail the recipe names.  When either mapping moves
+        -- a category renamed in the app, a gallery copy downloaded -- files
+        written before the move are spelled wrong, and would read back as
+        edits.  Each is read with the spelling it was written in and written
+        back in the current one, so the recipe it holds, local edits and all,
+        is exactly what it was.  A file whose spelling did not change is not
+        touched.
+        """
+        new = self.format
+
+        if new == old:
             return []
 
         rewritten = []
@@ -348,21 +434,18 @@ class Repository:
                 recipe, extras = old.parse(content, RemoteRecipe)
             except PaprikaUserError:
                 # Whatever is wrong with it, the command about to read it will
-                # say so; renaming a category is no reason to touch it.
+                # say so; a change of spelling is no reason to touch it.
                 continue
 
-            if old.categories.display_all(
-                recipe.categories
-            ) == new.categories.display_all(recipe.categories):
+            respelled = new.render(recipe, extras)
+
+            if respelled == old.render(recipe, extras):
                 continue
 
             with open(path, "w", encoding="utf-8") as outf:
-                outf.write(new.render(recipe, extras))
+                outf.write(respelled)
 
             rewritten.append(path)
-
-        categories.save(self.categories_path)
-        self._format = None
 
         return rewritten
 
@@ -450,18 +533,40 @@ class Repository:
             except ValueError:
                 return None
 
+        gallery = data.get("gallery") or {}
+
         return PhotoState(
             photo=str(data.get("photo", "")),
             photo_hash=str(data.get("photo_hash", "")),
             content_hash=str(data.get("content_hash", "")),
+            large=str(data.get("large", "") or ""),
+            gallery={
+                str(name): GalleryPhotoState.from_dict(entry)
+                for name, entry in gallery.items()
+                if isinstance(entry, dict)
+            },
         )
 
-    def write_photo(self, uid: str, photo: str, photo_hash: str, data: bytes) -> Path:
-        """Write a recipe's photo into `attachments/`, and remember what it was."""
-        path = self.attachment_path(photo)
-        state = self.read_photo_state(uid)
+    def _save_photo_state(self, uid: str, state: PhotoState) -> None:
+        path = self._photo_state_path(uid)
 
-        if state is not None and state.photo and state.photo != photo:
+        if not state.photo and not state.gallery:
+            path.unlink(missing_ok=True)
+        else:
+            self.photo_state_dir.mkdir(parents=True, exist_ok=True)
+
+            with open(path, "w", encoding="utf-8") as outf:
+                json.dump(asdict(state), outf, indent=2, sort_keys=True)
+
+        # Where the embeds link to may have moved; see `photo_links`.
+        self._format = None
+
+    def write_photo(self, uid: str, photo: str, photo_hash: str, data: bytes) -> Path:
+        """Write a recipe's thumbnail into `attachments/`, and remember it."""
+        path = self.attachment_path(photo)
+        state = self.read_photo_state(uid) or PhotoState()
+
+        if state.photo and state.photo != photo and state.photo not in state.gallery:
             # The recipe's photo was replaced under a new name; the old file
             # is nobody's now, and leaving it would litter the vault.
             self.attachment_path(state.photo).unlink(missing_ok=True)
@@ -469,60 +574,161 @@ class Repository:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
 
-        self.photo_state_dir.mkdir(parents=True, exist_ok=True)
-        with open(self._photo_state_path(uid), "w", encoding="utf-8") as outf:
-            json.dump(
-                asdict(
-                    PhotoState(
-                        photo=photo,
-                        photo_hash=photo_hash,
-                        content_hash=hashlib.sha256(data).hexdigest(),
-                    )
-                ),
-                outf,
-                indent=2,
-                sort_keys=True,
-            )
+        self._save_photo_state(
+            uid,
+            replace(
+                state,
+                photo=photo,
+                photo_hash=photo_hash,
+                content_hash=hashlib.sha256(data).hexdigest(),
+            ),
+        )
 
         return path
 
-    def drop_photo(self, uid: str) -> None:
-        """Remove a recipe's photo from `attachments/`, and the record of it."""
+    def drop_thumbnail(self, uid: str) -> None:
+        """Remove a recipe's thumbnail, leaving its gallery alone."""
         state = self.read_photo_state(uid)
 
-        if state is not None and state.photo:
+        if state is None:
+            return
+
+        if state.photo and state.photo not in state.gallery:
             self.attachment_path(state.photo).unlink(missing_ok=True)
 
+        self._save_photo_state(
+            uid, replace(state, photo="", photo_hash="", content_hash="", large="")
+        )
+
+    def write_gallery_photo(
+        self, uid: str, filename: str, record: GalleryPhotoState, data: bytes
+    ) -> Path:
+        """Write one gallery photo into `attachments/`, and remember it."""
+        path = self.attachment_path(filename)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+        state = self.read_photo_state(uid) or PhotoState()
+        gallery = dict(state.gallery)
+        gallery[filename] = replace(
+            record, content_hash=hashlib.sha256(data).hexdigest()
+        )
+        self._save_photo_state(uid, replace(state, gallery=gallery))
+
+        return path
+
+    def record_gallery_photo(
+        self, uid: str, filename: str, record: GalleryPhotoState
+    ) -> None:
+        """Update what we know of a gallery photo whose bytes did not change."""
+        state = self.read_photo_state(uid) or PhotoState()
+        gallery = dict(state.gallery)
+        content_hash = gallery[filename].content_hash if filename in gallery else ""
+        gallery[filename] = replace(record, content_hash=content_hash)
+        self._save_photo_state(uid, replace(state, gallery=gallery))
+
+    def drop_gallery_photo(self, uid: str, filename: str) -> None:
+        """Remove one gallery photo from `attachments/`, and the record of it."""
+        state = self.read_photo_state(uid)
+
+        if state is None or filename not in state.gallery:
+            return
+
+        if filename != state.photo:
+            self.attachment_path(filename).unlink(missing_ok=True)
+
+        gallery = {k: v for k, v in state.gallery.items() if k != filename}
+        large = state.large if state.large != filename else ""
+        self._save_photo_state(uid, replace(state, gallery=gallery, large=large))
+
+    def set_large_photo(self, uid: str, filename: str) -> None:
+        """Say which gallery photo the embed should show; "" for the thumbnail."""
+        state = self.read_photo_state(uid)
+
+        if state is None or state.large == filename:
+            return
+
+        self._save_photo_state(uid, replace(state, large=filename))
+
+    def drop_photo(self, uid: str) -> None:
+        """Remove all of a recipe's photos from `attachments/`, and their record."""
+        state = self.read_photo_state(uid)
+
+        if state is not None:
+            for filename in {state.photo, *state.gallery} - {""}:
+                self.attachment_path(filename).unlink(missing_ok=True)
+
         self._photo_state_path(uid).unlink(missing_ok=True)
+        self._format = None
+
+    def mirrored_files(self) -> set[str]:
+        """Every attachment that is a copy of something on the server."""
+        files: set[str] = set()
+
+        for uid in self._photo_state_uids():
+            state = self.read_photo_state(uid)
+
+            if state is not None:
+                files |= {state.photo, *state.gallery} - {""}
+
+        return files
 
     def _photo_state_path(self, uid: str) -> Path:
         return self.photo_state_dir / f"{uid}.json"
+
+    def _photo_state_uids(self) -> list[str]:
+        if not self.photo_state_dir.is_dir():
+            return []
+
+        return sorted(path.stem for path in self.photo_state_dir.glob("*.json"))
+
+    def _differs(self, filename: str, content_hash: str) -> bool:
+        """Do the bytes in `attachments/filename` differ from those we wrote?
+
+        A missing file has not been replaced; it is `pull`'s to heal.
+        """
+        try:
+            path = self.attachment_path(filename)
+        except PaprikaUserError:
+            return False
+
+        if not path.is_file():
+            return False
+
+        return hashlib.sha256(path.read_bytes()).hexdigest() != content_hash
 
     def _photo_replaced(self, uid: str, recipe: RemoteRecipe) -> bool:
         """Has the user swapped out the image behind an unchanged embed?
 
         Only asked about an attachment we downloaded ourselves: when the
         embed names anything else, the *field* has changed and ordinary
-        change detection already sees it.  Comparing a digest of the file
-        against the one recorded at download time is what Paprika's own
-        `photo_hash` cannot do for us, since it digests the thumbnail the
-        server holds rather than any bytes we have.
+        change detection already sees it.  The file checked is the thumbnail
+        the embed shows; the full-size copy it links to is a gallery photo,
+        whose replacement `_gallery_replaced` notices.  Comparing a digest of
+        the file against the one recorded at download time is what Paprika's
+        own `photo_hash` cannot do for us.
         """
         state = self.read_photo_state(uid)
 
         if state is None or not state.photo or state.photo != recipe.photo:
             return False
 
-        try:
-            path = self.attachment_path(state.photo)
-        except PaprikaUserError:
-            return False
+        return self._differs(state.photo, state.content_hash)
 
-        if not path.is_file():
-            # Gone is not replaced; a missing attachment is `pull`'s to heal.
-            return False
+    def _gallery_replaced(self, uid: str, recipe: RemoteRecipe) -> frozenset[str]:
+        """The gallery files the recipe lists whose bytes were swapped out."""
+        state = self.read_photo_state(uid)
 
-        return hashlib.sha256(path.read_bytes()).hexdigest() != state.content_hash
+        if state is None:
+            return frozenset()
+
+        listed = {filename for filename, _ in recipe.gallery}
+
+        return frozenset(
+            filename
+            for filename, record in state.gallery.items()
+            if filename in listed and self._differs(filename, record.content_hash)
+        )
 
     # -- The working directory ----------------------------------------------
 
@@ -616,13 +822,19 @@ class Repository:
                 "so there is nothing to restore it to."
             )
 
-        if self._photo_replaced(uid, base):
+        state = self.read_photo_state(uid)
+
+        if state is not None:
             # An image swapped out in place is a local change like any other,
             # so restoring discards it too.  We cannot re-download it from
             # here -- restore works without the network -- but removing the
             # file is enough: the state file still says which photo belongs
             # there, so the next pull sees it missing and puts it back.
-            self.attachment_path(base.photo).unlink(missing_ok=True)
+            if self._photo_replaced(uid, base):
+                self.attachment_path(state.photo).unlink(missing_ok=True)
+
+            for filename in self._gallery_replaced(uid, base):
+                self.attachment_path(filename).unlink(missing_ok=True)
 
         return self.store(base)
 
@@ -805,10 +1017,11 @@ class Repository:
 
             recipe, extras = self.read_document(path)
             photo_replaced = self._photo_replaced(uid, recipe)
+            gallery_replaced = self._gallery_replaced(uid, recipe)
 
             if uid not in base_uids:
                 status = Status.ADDED
-            elif photo_replaced or self.is_modified(uid, path):
+            elif photo_replaced or gallery_replaced or self.is_modified(uid, path):
                 # A replaced image is a modification the file's text cannot
                 # show, so it is asked about before the text is.
                 status = Status.MODIFIED
@@ -824,6 +1037,7 @@ class Repository:
                     base=base,
                     extras=extras,
                     photo_replaced=photo_replaced,
+                    gallery_replaced=gallery_replaced,
                 )
             )
 

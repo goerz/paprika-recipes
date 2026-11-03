@@ -9,9 +9,15 @@ sizes the app uses, so that a photo added from a directory is
 indistinguishable from one added in the app.
 
 The full-size image is passed through untouched when it already is what we
-would have produced -- a JPEG within the size cap, the right way up -- so
-that pushing a photo and pulling it back yields the very bytes the user
-supplied whenever that is possible at all.
+would have produced -- a JPEG within the size and byte caps, the right way
+up, with no location in its metadata -- so that pushing a photo and pulling
+it back yields the very bytes the user supplied whenever that is possible.
+
+Anything Pillow can open is accepted, which with `pillow-heif` installed
+includes the HEIC photos an iPhone takes.  Whatever comes in goes up as a
+JPEG of at most `MAX_PHOTO_BYTES`: a photo that encodes larger at the
+app's quality is re-encoded at lower quality, then scaled down, until it
+fits.  Re-encoding drops the original's metadata, GPS position included.
 """
 
 from __future__ import annotations
@@ -24,6 +30,13 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .exceptions import PaprikaUserError
 
+try:  # HEIC/HEIF support, for photos straight off an iPhone.
+    from pillow_heif import register_heif_opener
+except ImportError:  # pragma: no cover - an optional extra in principle
+    pass
+else:
+    register_heif_opener()
+
 #: The square thumbnail the app uploads as the recipe's `photo`, in pixels.
 THUMBNAIL_SIZE: Final = 280
 
@@ -32,6 +45,15 @@ FULL_SIZE_LIMIT: Final = 2048
 
 #: Matches the visible quality of the app's own uploads closely enough.
 JPEG_QUALITY: Final = 85
+
+#: The most a full-size photo may weigh when it goes up.
+MAX_PHOTO_BYTES: Final = 1_000_000
+
+#: How far quality is lowered before resolution is given up instead.
+MIN_JPEG_QUALITY: Final = 70
+
+#: The EXIF tags that say where a photo was taken.
+GPS_IFD: Final = 0x8825
 
 
 @dataclass(frozen=True)
@@ -53,11 +75,14 @@ def prepare_photo(data: bytes) -> PreparedPhoto:
         with Image.open(io.BytesIO(data)) as source:
             # EXIF orientation 1 is "already the right way up"; anything else
             # means the pixels are stored rotated and the tag says how.
-            sideways = source.getexif().get(0x0112, 1) != 1
+            exif = source.getexif()
+            sideways = exif.get(0x0112, 1) != 1
             untouched = (
                 source.format == "JPEG"
                 and not sideways
                 and max(source.size) <= FULL_SIZE_LIMIT
+                and len(data) <= MAX_PHOTO_BYTES
+                and GPS_IFD not in exif
             )
 
             image = ImageOps.exif_transpose(source) if sideways else source
@@ -67,8 +92,30 @@ def prepare_photo(data: bytes) -> PreparedPhoto:
 
     return PreparedPhoto(
         thumbnail=_encode(ImageOps.fit(image, (THUMBNAIL_SIZE, THUMBNAIL_SIZE))),
-        full=data if untouched else _encode(_fit_within(image, FULL_SIZE_LIMIT)),
+        full=data if untouched else _encode_within_cap(image),
     )
+
+
+def _encode_within_cap(image: Image.Image) -> bytes:
+    """Encode at the app's size and quality, giving ground until it fits.
+
+    Quality goes first, in small steps, since down to the floor the loss is
+    hard to see; after that the picture is scaled down, which always ends.
+    """
+    limit = FULL_SIZE_LIMIT
+    fitted = _fit_within(image, limit)
+
+    for quality in range(JPEG_QUALITY, MIN_JPEG_QUALITY - 1, -5):
+        encoded = _encode(fitted, quality)
+
+        if len(encoded) <= MAX_PHOTO_BYTES:
+            return encoded
+
+    while len(encoded) > MAX_PHOTO_BYTES and limit > THUMBNAIL_SIZE:
+        limit = int(limit * 0.85)
+        encoded = _encode(_fit_within(image, limit), MIN_JPEG_QUALITY)
+
+    return encoded
 
 
 def _fit_within(image: Image.Image, limit: int) -> Image.Image:
@@ -82,7 +129,7 @@ def _fit_within(image: Image.Image, limit: int) -> Image.Image:
     return scaled
 
 
-def _encode(image: Image.Image) -> bytes:
+def _encode(image: Image.Image, quality: int = JPEG_QUALITY) -> bytes:
     """Encode as JPEG, flattening any transparency onto white first."""
     if image.mode in ("RGBA", "LA", "PA") or (
         image.mode == "P" and "transparency" in image.info
@@ -94,6 +141,6 @@ def _encode(image: Image.Image) -> bytes:
         image = image.convert("RGB")
 
     out = io.BytesIO()
-    image.save(out, format="JPEG", quality=JPEG_QUALITY)
+    image.save(out, format="JPEG", quality=quality)
 
     return out.getvalue()

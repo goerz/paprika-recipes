@@ -28,7 +28,13 @@ from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import TYPE_CHECKING, Any, Final, TypeVar
 
-from .markdown import BODY_FIELDS, HIDDEN_FIELDS, PHOTO_FIELD, TITLE_FIELD
+from .markdown import (
+    BODY_FIELDS,
+    GALLERY_FIELD,
+    HIDDEN_FIELDS,
+    PHOTO_FIELD,
+    TITLE_FIELD,
+)
 
 if TYPE_CHECKING:
     from .recipe import BaseRecipe
@@ -41,8 +47,11 @@ _Change = tuple[int, int, list[str]]
 #: Fields we can merge line by line.  The name and the photo are deliberately
 #: not among them: each is a single line -- the document's title, the embed
 #: beneath it -- and a conflict marker inside either is worse than being
-#: asked to choose.
-MERGEABLE_FIELDS: Final = frozenset(BODY_FIELDS - {TITLE_FIELD, PHOTO_FIELD})
+#: asked to choose.  The gallery is a list of images, not text, so it is
+#: taken from whichever side changed it, or refused if both did.
+MERGEABLE_FIELDS: Final = frozenset(
+    BODY_FIELDS - {TITLE_FIELD, PHOTO_FIELD, GALLERY_FIELD}
+)
 
 #: Never diffed on either side.  `hash` is the server's token, not a value,
 #: and the photo's bookkeeping (`photo_hash` and friends) never enters a

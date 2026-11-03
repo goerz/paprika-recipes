@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import io
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, TypeVar
 from urllib.parse import quote, unquote
@@ -90,6 +91,14 @@ PHOTO_FIELDS: Final = frozenset({PHOTO_FIELD}) | HIDDEN_FIELDS
 #: it plainly is; our own renderer percent-encodes all of that anyway.
 PHOTO_EMBED: Final = re.compile(rf"^!\[[^\]]*\]\({ATTACHMENTS_DIRNAME}/(.+)\)\s*$")
 
+#: The same embed wrapped in a link to the full-size picture, which is how
+#: the photo is written when we have one; see `DocumentFormat.photo_links`.
+#: The image inside is the photo, and the link target is presentation only.
+PHOTO_LINKED: Final = re.compile(
+    rf"^\[!\[[^\]]*\]\({ATTACHMENTS_DIRNAME}/(.+?)\)\]"
+    rf"\({ATTACHMENTS_DIRNAME}/(.+)\)\s*$"
+)
+
 #: Written as `## ` sections, in this order.  Every recipe field not named
 #: here or above is written to the frontmatter instead.
 SECTIONS: Final[tuple[tuple[str, str], ...]] = (
@@ -97,6 +106,22 @@ SECTIONS: Final[tuple[tuple[str, str], ...]] = (
     ("Directions", "directions"),
     ("Notes", "notes"),
     ("Nutritional Information", "nutritional_info"),
+)
+
+#: The recipe's photo gallery: a list of `[filename, caption]` pairs, in
+#: order, written as a `## Photos` section after every other section: a
+#: bullet list of links to the pictures, captioned, so that a previewer shows
+#: a tidy list rather than a wall of full-size images.  It is not part of Paprika's recipe JSON -- the gallery is a
+#: separate collection on the server -- but it travels with the recipe so that
+#: change detection, merging and restoring treat it like any other field.
+GALLERY_FIELD: Final = "gallery"
+GALLERY_HEADING: Final = "Photos"
+
+#: One line of the `## Photos` section: a link (or, for an uncaptioned
+#: photo, an image) pointing into `attachments/`, optionally as a bullet.
+#: The caption may hold backslash-escaped brackets; see `_gallery_line`.
+GALLERY_LINE: Final = re.compile(
+    r"^(?:[-*+] )?!?\[((?:\\.|[^\]\\])*)\]\(" + ATTACHMENTS_DIRNAME + r"/(.+)\)\s*$"
 )
 
 #: Fields rendered as a markdown bullet list, one bullet per line of the blob.
@@ -108,7 +133,8 @@ LIST_FIELDS: Final = frozenset({"ingredients"})
 BULLETS: Final = ("- ", "* ", "+ ")
 
 BODY_FIELDS: Final = frozenset(
-    {TITLE_FIELD, DESCRIPTION_FIELD, PHOTO_FIELD} | {field for _, field in SECTIONS}
+    {TITLE_FIELD, DESCRIPTION_FIELD, PHOTO_FIELD, GALLERY_FIELD}
+    | {field for _, field in SECTIONS}
 )
 
 _HEADINGS_BY_TITLE: Final = dict(SECTIONS)
@@ -186,6 +212,12 @@ class DocumentFormat:
 
     frontmatter_prefix: str = ""
     categories: CategoryNames = field(default_factory=CategoryNames)
+    #: Where the photo embed links to: each recipe's thumbnail mapped to its
+    #: full-size gallery copy.  The embed shows the thumbnail, which previews
+    #: well anywhere, and clicking it opens the picture itself.  The link is
+    #: presentation only: reading a file back ignores where it points.  See
+    #: `Repository.photo_links`.
+    photo_links: Mapping[str, str] = field(default_factory=dict)
 
     def render(self, recipe: BaseRecipe, extras: Extras | None = None) -> str:
         """Render a recipe as a markdown document with YAML frontmatter."""
@@ -204,7 +236,7 @@ class DocumentFormat:
             }
         )
 
-        return _render(data, frontmatter, extras)
+        return _render(data, frontmatter, extras, self.photo_links)
 
     def parse(self, content: str, recipe_class: type[T]) -> tuple[T, Extras]:
         """Read a document as both a recipe and whatever else its file holds."""
@@ -318,7 +350,12 @@ def find_lossy_fields(recipe: BaseRecipe, extras: Extras | None = None) -> list[
     return DEFAULT_FORMAT.find_lossy_fields(recipe, extras)
 
 
-def _render(data: dict[str, Any], frontmatter: dict[str, Any], extras: Extras) -> str:
+def _render(
+    data: dict[str, Any],
+    frontmatter: dict[str, Any],
+    extras: Extras,
+    photo_links: Mapping[str, str] | None = None,
+) -> str:
     out = io.StringIO()
     out.write(f"{FRONTMATTER_DELIMITER}\n")
     dump_yaml(frontmatter, out)
@@ -327,7 +364,13 @@ def _render(data: dict[str, Any], frontmatter: dict[str, Any], extras: Extras) -
 
     photo = data.get(PHOTO_FIELD) or ""
     if photo:
-        out.write(f"\n{_photo_embed(photo, data.get(TITLE_FIELD) or '')}\n")
+        embed = _photo_embed(photo, data.get(TITLE_FIELD) or "")
+        full = (photo_links or {}).get(photo)
+
+        if full:
+            embed = f"[{embed}]({ATTACHMENTS_DIRNAME}/{quote(full, safe='')})"
+
+        out.write(f"\n{embed}\n")
 
     description = _render_field(DESCRIPTION_FIELD, data.get(DESCRIPTION_FIELD) or "")
     if description:
@@ -347,6 +390,15 @@ def _render(data: dict[str, Any], frontmatter: dict[str, Any], extras: Extras) -
 
         placed.add(field_name)
         _render_extras(out, extras, field_name)
+
+    gallery = data.get(GALLERY_FIELD) or []
+    if gallery:
+        out.write(f"\n## {GALLERY_HEADING}\n\n")
+        out.write("\n".join(_gallery_line(*entry) for entry in gallery))
+        out.write("\n")
+
+        placed.add(GALLERY_FIELD)
+        _render_extras(out, extras, GALLERY_FIELD)
 
     # A section anchored to one of ours that this recipe no longer has still
     # needs to go somewhere; the end is the only honest place left for it.
@@ -432,7 +484,13 @@ def normalize_recipe(recipe: T) -> T:
     """
     changes: dict[str, Any] = {}
 
-    for field_name in BODY_FIELDS:
+    if hasattr(recipe, GALLERY_FIELD):
+        gallery = normalize_gallery(getattr(recipe, GALLERY_FIELD))
+
+        if gallery != getattr(recipe, GALLERY_FIELD):
+            changes[GALLERY_FIELD] = gallery
+
+    for field_name in BODY_FIELDS - {GALLERY_FIELD}:
         value = getattr(recipe, field_name, None)
 
         if value is None:
@@ -451,6 +509,22 @@ def normalize_recipe(recipe: T) -> T:
             changes[field_name] = normalized
 
     return replace(recipe, **changes) if changes else recipe
+
+
+def normalize_gallery(gallery: Any) -> list[list[str]]:
+    """A gallery as `[filename, caption]` lists, in the form a file can hold.
+
+    A caption is a single line of alt text, so line breaks inside one are
+    folded to spaces and its ends are trimmed; Paprika stores whatever its
+    app was given.
+    """
+    result = []
+
+    for filename, caption in gallery or []:
+        caption = " ".join(_normalize_newlines(caption or "").split("\n")).strip()
+        result.append([str(filename), caption])
+
+    return result
 
 
 def _normalize_newlines(value: str) -> str:
@@ -504,6 +578,43 @@ def _photo_embed(photo: str, name: str) -> str:
     return f"![{alt}]({ATTACHMENTS_DIRNAME}/{quote(photo, safe='')})"
 
 
+def _gallery_line(filename: str, caption: str) -> str:
+    """One line of the `## Photos` section: a bullet linking to the picture.
+
+    The caption is the link text.  An uncaptioned photo is written as an
+    image instead, since an empty link would be invisible in a preview.
+    Backslashes and brackets in the caption are escaped, so that any caption
+    reads back exactly; the filename is percent-encoded, as for the photo.
+    """
+    text = re.sub(r"([\\\[\]])", r"\\\1", caption)
+    target = f"({ATTACHMENTS_DIRNAME}/{quote(filename, safe='')})"
+
+    return f"- [{text}]{target}" if text else f"- ![]{target}"
+
+
+def _parse_gallery(text: str) -> list[list[str]]:
+    """Read the `## Photos` section back into `[filename, caption]` pairs."""
+    gallery = []
+
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+
+        match = GALLERY_LINE.match(line)
+
+        if match is None:
+            raise PaprikaUserError(
+                f"`## {GALLERY_HEADING}` may only hold links to (or images "
+                f"of) files in {ATTACHMENTS_DIRNAME}/, one per line, but "
+                f"found {line!r}."
+            )
+
+        caption = re.sub(r"\\(.)", r"\1", match.group(1))
+        gallery.append([unquote(match.group(2)), caption])
+
+    return gallery
+
+
 def _split_photo(text: str) -> tuple[str, str]:
     """Take the photo embed off the top of the description block.
 
@@ -512,12 +623,19 @@ def _split_photo(text: str) -> tuple[str, str]:
     else in their prose is their text, not our markup, and stays put.
     """
     first, _, rest = text.partition("\n")
-    match = PHOTO_EMBED.match(first)
+    photo = _photo_line(first)
 
-    if match is None:
+    if photo is None:
         return "", text
 
-    return unquote(match.group(1)), rest.strip("\n")
+    return unquote(photo), rest.strip("\n")
+
+
+def _photo_line(line: str) -> str | None:
+    """The photo a line embeds, linked or not; None if it is not an embed."""
+    match = PHOTO_LINKED.match(line) or PHOTO_EMBED.match(line)
+
+    return match.group(1) if match is not None else None
 
 
 def _escape_prose(value: str) -> str:
@@ -538,7 +656,7 @@ def _escape_prose(value: str) -> str:
     any previewer.
     """
     return "\n".join(
-        f"\\{line}" if _is_heading(line) or PHOTO_EMBED.match(line) else line
+        f"\\{line}" if _is_heading(line) or _photo_line(line) is not None else line
         for line in value.split("\n")
     )
 
@@ -553,7 +671,7 @@ def _is_escaped(line: str) -> bool:
     if not line.startswith("\\"):
         return False
 
-    return _is_heading(line[1:]) or PHOTO_EMBED.match(line[1:]) is not None
+    return _is_heading(line[1:]) or _photo_line(line[1:]) is not None
 
 
 def _split_frontmatter(content: str) -> tuple[dict[str, Any], str]:
@@ -590,9 +708,9 @@ def _split_frontmatter(content: str) -> tuple[dict[str, Any], str]:
     )
 
 
-def _parse_body(body: str) -> tuple[dict[str, str], tuple[ExtraSection, ...]]:
+def _parse_body(body: str) -> tuple[dict[str, Any], tuple[ExtraSection, ...]]:
     """Split a document body into the recipe's fields and everything else."""
-    result: dict[str, str] = {}
+    result: dict[str, Any] = {}
     seen_title = False
 
     # Each block is a heading and the lines beneath it; the first block, with
@@ -625,6 +743,11 @@ def _parse_body(body: str) -> tuple[dict[str, str], tuple[ExtraSection, ...]]:
                 result[PHOTO_FIELD] = photo
             if text:
                 result[DESCRIPTION_FIELD] = _parse_field(DESCRIPTION_FIELD, text)
+            continue
+
+        if heading == GALLERY_HEADING:
+            result[GALLERY_FIELD] = _parse_gallery(text)
+            anchor = GALLERY_FIELD
             continue
 
         field_name = _HEADINGS_BY_TITLE.get(heading)

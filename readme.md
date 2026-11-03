@@ -15,7 +15,7 @@ paprika-recipes push
 - **Your recipes become real files** -- one markdown file per recipe: editable, greppable, diffable, and perfectly at home in a git repository.
 - **Made to live in a note vault** -- clone straight into Obsidian or anything like it: photos render inline, your own tags, aliases, and extra sections stay in the files without ever being uploaded, and a [frontmatter prefix](#keeping-out-of-your-vaults-way) keeps Paprika's fields from colliding with your vault's.
 - **Two-way, not just export** -- edits you make locally go back to Paprika, changes you make in the app come down, and `status` shows you exactly what would be sent before anything is.
-- **Photos sync in both directions** -- each recipe's photo is downloaded and embedded beneath its title, and adding, swapping, or deleting that embed line uploads, replaces, or removes the photo in Paprika.
+- **Photos sync in both directions** -- each recipe's thumbnail and full-size gallery are mirrored, the thumbnail embedded beneath its title, and adding, swapping, or deleting an embed or gallery line uploads, replaces, or removes the photo in Paprika.
 - **Write new recipes in your editor** -- a markdown file with a `# Title` becomes a real Paprika recipe on the next `push`.
 - **You already know the commands** -- `clone`, `pull`, `push`, `status`, `restore`, with `--dry-run` everywhere and `--json` plus meaningful exit codes when you are scripting.
 
@@ -167,19 +167,30 @@ The one thing `restore` will not do is delete a recipe you created yourself and 
 
 **Reformatting a file is not an edit.** Rewrapping a list or reordering the frontmatter changes the file without changing the recipe, and nothing gets uploaded for it.
 
-**Photos sync, in both directions.** A recipe's photo is downloaded into an `attachments/` folder beside your files, and the recipe embeds it with ordinary markdown image markup directly beneath its title — so it shows up in your editor, your vault, and anywhere else markdown renders. If you tidy the attachment away by hand, the next `pull` quietly puts it back.
-
-The embed line is also how you change the photo. To give a recipe one, drop the image into `attachments/` and write the embed yourself, spelled however you like:
+**Photos sync, in both directions.** `attachments/` mirrors exactly the files Paprika holds for each recipe: its square thumbnail, and every photo in its gallery at full size. The thumbnail is embedded directly beneath the title, as a link to the full-size picture, so a preview on GitHub or in your editor shows a tidy thumbnail and a click opens the real thing:
 
 ```markdown
 # Khachapuri
 
-![fresh out of the oven](attachments/my dinner.jpg)
+[![Photo of Khachapuri](attachments/D2246B0B-….jpg)](attachments/58F7436A-….jpg)
 ```
 
-`push` then uploads it exactly the way the app would — a square thumbnail onto the recipe, the full picture into its photo gallery — and renames your file to the name the server chose, rewriting the embed to match. Deleting the embed line removes the photo from Paprika on the next push, and swapping the image file out for different bytes replaces it, even though the file's text never changed; `status` reports every one of these as `modified: (photo)` so nothing leaves without your having seen it. Anything reasonable is accepted — a PNG becomes a JPEG on the way up, a sideways phone photo is stood upright, and anything larger than the 2048-pixel bound the app itself observes is scaled down to it.
+The gallery is listed in a `## Photos` section at the end of the file, one captioned link per photo, in the gallery's order:
 
-One honest caveat: the copy in *your* directory keeps its full size, but what another clone downloads is the app's own copy of the recipe photo, which is the thumbnail. The full picture still lives in the recipe's gallery in the app.
+```markdown
+## Photos
+
+- [Fresh out of the oven](attachments/58F7436A-….jpg)
+- [Grandma's recipe card](attachments/90206099-….jpg)
+```
+
+If you tidy an attachment away by hand, the next `pull` quietly puts it back.
+
+Both are how you change the photos, too. To give a recipe a new photo, drop the image into `attachments/` and point the embed at it, spelled however you like (`![fresh out of the oven](attachments/my dinner.jpg)`); where a link around it points doesn't matter, since the link is regenerated. `push` uploads it the way the app would, as a thumbnail on the recipe and the full picture in its gallery, and then downloads Paprika's copies, so your file gives way to the server's names. Pointing the embed at a photo already in the gallery makes that one the recipe's photo without uploading it twice. Deleting the embed line removes the recipe's photo but leaves the gallery alone.
+
+In `## Photos`, a new line pointing at a file you dropped into `attachments/` adds a gallery photo, deleting a line takes the photo down, and editing a caption or reordering lines changes the caption or order. Swapping an image file out for different bytes replaces that photo, even though the file's text never changed. `status` reports all of these as `modified: (photo)` or `modified: (gallery)`, so nothing leaves without your having seen it.
+
+Anything Pillow can open is accepted, including the HEIC photos an iPhone takes. A photo goes up as a JPEG no larger than the 2048-pixel bound the app itself observes and no heavier than 1 MB, stood upright, with its location data stripped; one that already is all of that goes up byte for byte.
 
 **Anything you add to a file is left alone.** If these files live in a note vault, you will likely add `tags:` or `aliases:` to the frontmatter, and quite possibly a section of your own:
 
