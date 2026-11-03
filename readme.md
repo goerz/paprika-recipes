@@ -236,6 +236,16 @@ The format is markdown with YAML frontmatter. The prose -- description, ingredie
 
 Notably, ingredient amounts are *not* parsed. Paprika stores ingredients as a single blob of text, and real recipes contain lines like `185 g wet ingredients: 2 large eggs, 3 large egg yolks, and enough water to reach 185 g in total` -- there is no amount to extract, and guessing at one would only lose information. What you write is what Paprika gets.
 
+### Categories
+
+Paprika's sync API refers to a recipe's categories by uid, but the files spell them by name, so `categories:` reads `- Dinners` and you can add a category by typing its name. Every `pull` and `push` fetches the account's category list and keeps a copy in `.paprika/categories.json`, which is what the names are looked up in.
+
+- Renaming a category in the app rewrites the `categories:` lines of the files that name it on the next `pull`. Nothing else in those files changes, and no recipe counts as edited.
+- `push` refuses to upload a recipe naming a category the account doesn't have, so a typo can't create a dangling category. This tool can't create categories, so make a new one in the app first; the next `push` picks it up.
+- A category the list no longer knows (one deleted in the app), and a name two categories share (possible when categories are nested), are written as the uid instead, so nothing is lost.
+
+A recipe can be in any number of categories. Folders don't represent them: you can sort files into folders however you like, but Paprika never sees the folders.
+
 ## Working with exported archives
 
 If you would rather not give this tool your account details at all, you can work with a `.paprikarecipes` export from the app instead. Export from Paprika, edit, import back:

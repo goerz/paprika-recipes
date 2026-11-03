@@ -8,6 +8,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .cache import Cache, NullCache
+from .categories import CategoryNames
 from .constants import DEFAULT_DOMAIN, USER_AGENT
 from .exceptions import PaprikaError, RequestError
 from .recipe import BaseRecipe
@@ -206,6 +207,12 @@ class Remote(RecipeManager):
             RemotePhoto(**{key: value for key, value in item.items() if key in known})
             for item in response.json().get("result", [])
         ]
+
+    def get_categories(self) -> CategoryNames:
+        """The account's categories, which recipes refer to by uid."""
+        response = self._request("get", "/api/v2/sync/categories/")
+
+        return CategoryNames.from_api(response.json().get("result") or [])
 
     def add_recipe(self, recipe: RemoteRecipe) -> RemoteRecipe:
         return self.upload_recipe(recipe)

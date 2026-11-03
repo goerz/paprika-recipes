@@ -44,6 +44,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
+from .categories import CategoryNames
 from .exceptions import PaprikaError, PaprikaUserError
 from .images import prepare_photo
 from .markdown import ATTACHMENTS_DIRNAME, PHOTO_FIELD, PHOTO_FIELDS, foreign_uid_key
@@ -62,6 +63,8 @@ class RemoteAccount(Protocol):
     """The part of `Remote` that syncing needs; a seam for testing."""
 
     def get_recipe_index(self) -> dict[str, str]: ...
+
+    def get_categories(self) -> CategoryNames: ...
 
     def get_recipe_by_id(self, id: str, hash: str) -> RemoteRecipe: ...
 
@@ -246,6 +249,8 @@ class Syncer:
         """Bring the working directory up to date with the server."""
         report = SyncReport()
 
+        self._refresh_categories(dry_run)
+
         index = self._remote.get_recipe_index()
         entries = {entry.uid: entry for entry in self._repository.status()}
         paths = {
@@ -403,6 +408,11 @@ class Syncer:
         """Send local changes to the server."""
         report = SyncReport()
 
+        # A category created in the app since the last pull is one the user
+        # may already have typed into a file; it has to be known by name
+        # before the files are read.
+        categories = self._refresh_categories(dry_run)
+
         entries = self._repository.status()
         refuse_unidentifiable(entries)
 
@@ -410,7 +420,7 @@ class Syncer:
         uploaded: list[str] = []
 
         for entry in entries:
-            uid = self._push_one(report, entry, index, dry_run)
+            uid = self._push_one(report, entry, index, dry_run, categories)
 
             if uid:
                 uploaded.append(uid)
@@ -434,6 +444,7 @@ class Syncer:
         entry: WorkingRecipe,
         index: dict[str, str],
         dry_run: bool,
+        categories: CategoryNames | None = None,
     ) -> str:
         """Push a single recipe; return its uid if it was sent to the server."""
         if entry.status is Status.UNCHANGED:
@@ -453,6 +464,18 @@ class Syncer:
                 name,
                 "still has unresolved conflict markers in it; edit them out "
                 "(or `restore` it) before pushing",
+            )
+            return ""
+
+        unknown = _unknown_categories(entry, categories)
+
+        if unknown:
+            report.record(
+                Action.SKIPPED,
+                entry.uid,
+                name,
+                f"was not pushed: Paprika has no {_categories_named(unknown)}; "
+                "create it in the app (or fix the spelling), then push again",
             )
             return ""
 
@@ -776,6 +799,21 @@ class Syncer:
 
         return self._remote.download_photo(url)
 
+    # -- Categories -------------------------------------------------------
+
+    def _refresh_categories(self, dry_run: bool) -> CategoryNames:
+        """Fetch the account's category names, and adopt them unless dry-running.
+
+        A dry run still reads with whatever names the directory already
+        has, since adopting new ones may mean rewriting files.
+        """
+        categories = self._remote.get_categories()
+
+        if not dry_run:
+            self._repository.update_categories(categories)
+
+        return categories
+
     # -- Plumbing -----------------------------------------------------------
 
     def _fetch(self, uid: str, hash: str) -> RemoteRecipe:
@@ -810,6 +848,33 @@ class _PhotoPlan:
     source: str = ""
     #: What to tell the user about all of the above.
     note: str = ""
+
+
+def _unknown_categories(
+    entry: WorkingRecipe, categories: CategoryNames | None
+) -> list[str]:
+    """Categories a recipe names that the account does not have.
+
+    Only categories the file adds are checked.  One the base copy already
+    held may well be a category since deleted in the app; that is the
+    server's own doing, and no reason to refuse an unrelated edit.
+    """
+    if categories is None or entry.recipe is None:
+        return []
+
+    held = set(entry.base.categories) if entry.base is not None else set()
+    added = [value for value in entry.recipe.categories if value not in held]
+
+    return categories.unknown(added)
+
+
+def _categories_named(names: list[str]) -> str:
+    quoted = [repr(name) for name in names]
+
+    if len(quoted) == 1:
+        return f"category {quoted[0]}"
+
+    return f"categories {_and(quoted)}"
 
 
 def _photo_filename() -> str:

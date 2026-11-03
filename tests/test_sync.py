@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from paprika_recipes.categories import CategoryNames
 from paprika_recipes.commands.restore import matches
 from paprika_recipes.exceptions import PaprikaUserError, RequestError
 from paprika_recipes.remote import RemotePhoto, RemoteRecipe
@@ -25,6 +26,7 @@ class FakeAccount:
         self.recipes: dict[str, dict[str, Any]] = {}
         self.photos: dict[str, bytes] = {}
         self.gallery: dict[str, RemotePhoto] = {}
+        self.categories: dict[str, str] = {}
         self.notified = 0
         self.index_requests = 0
         self.photo_downloads = 0
@@ -43,6 +45,9 @@ class FakeAccount:
 
     def get_recipe_by_id(self, id: str, hash: str) -> RemoteRecipe:
         return RemoteRecipe.from_dict(self.recipes[id])
+
+    def get_categories(self) -> CategoryNames:
+        return CategoryNames(dict(self.categories))
 
     def download_photo(self, url: str) -> bytes:
         self.photo_downloads += 1
@@ -1433,3 +1438,86 @@ class TestRestoringPhotos:
 
         Syncer(repository, account).pull()
         assert (repository.attachments_dir / "A-1.jpg").read_bytes() == b"the original"
+
+
+class TestCategoryNames:
+    SOUPS = "SOUPS-UID"
+
+    @pytest.fixture
+    def account(self) -> FakeAccount:
+        account = FakeAccount(make_recipe("A", categories=["DINNERS-UID"]))
+        account.categories = {"DINNERS-UID": "Dinners"}
+
+        return account
+
+    def test_pull_writes_names_and_remembers_them(self, repository, account):
+        Syncer(repository, account).pull()
+
+        path = repository.paths_by_uid()["A"]
+        assert "- Dinners\n" in path.read_text(encoding="utf-8")
+        assert repository.categories.names == {"DINNERS-UID": "Dinners"}
+
+    def test_a_rename_in_the_app_reaches_the_files_on_pull(self, repository, account):
+        Syncer(repository, account).pull()
+        account.categories = {"DINNERS-UID": "Suppers"}
+
+        Syncer(repository, account).pull()
+
+        path = repository.paths_by_uid()["A"]
+        assert "- Suppers\n" in path.read_text(encoding="utf-8")
+        assert {entry.status for entry in repository.status()} == {Status.UNCHANGED}
+
+    def test_a_dry_run_leaves_the_names_alone(self, repository, account):
+        Syncer(repository, account).pull()
+        account.categories = {"DINNERS-UID": "Suppers"}
+
+        Syncer(repository, account).pull(dry_run=True)
+
+        assert repository.categories.names == {"DINNERS-UID": "Dinners"}
+
+    def test_push_sends_uids_for_names(self, repository, account):
+        Syncer(repository, account).pull()
+        account.categories[self.SOUPS] = "Soups"
+        edit_file(repository, "A", "- Dinners\n", "- Dinners\n- Soups\n")
+
+        report = Syncer(repository, account).push()
+
+        assert actions(report) == {"Recipe A": Action.UPLOADED}
+        assert account.recipes["A"]["categories"] == ["DINNERS-UID", self.SOUPS]
+        assert "- Soups\n" in repository.paths_by_uid()["A"].read_text(encoding="utf-8")
+
+    def test_push_refuses_a_category_the_account_does_not_have(
+        self, repository, account
+    ):
+        Syncer(repository, account).pull()
+        edit_file(repository, "A", "- Dinners\n", "- Dinners\n- Soups\n")
+
+        report = Syncer(repository, account).push()
+
+        [change] = report.changes
+        assert change.action is Action.SKIPPED
+        assert "no category 'Soups'" in change.detail
+        assert account.recipes["A"]["categories"] == ["DINNERS-UID"]
+
+    def test_a_deleted_category_does_not_block_an_unrelated_edit(
+        self, repository, account
+    ):
+        Syncer(repository, account).pull()
+        account.categories = {}
+        Syncer(repository, account).pull()
+        edit_file(repository, "A", "1 tsp salt", "2 tsp salt")
+
+        report = Syncer(repository, account).push()
+
+        assert actions(report) == {"Recipe A": Action.UPLOADED}
+
+    def test_a_new_recipe_can_name_its_categories(self, repository, account):
+        Syncer(repository, account).pull()
+        (repository.root / "Stew.md").write_text(
+            "---\ncategories:\n- Dinners\n---\n\n# Stew\n", encoding="utf-8"
+        )
+
+        Syncer(repository, account).push()
+
+        [created] = [r for r in account.recipes.values() if r["name"] == "Stew"]
+        assert created["categories"] == ["DINNERS-UID"]

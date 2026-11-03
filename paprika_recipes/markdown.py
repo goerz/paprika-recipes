@@ -32,6 +32,7 @@ from urllib.parse import quote, unquote
 
 from yaml import YAMLError
 
+from .categories import CategoryNames
 from .exceptions import PaprikaUserError
 from .utils import dump_yaml, load_yaml
 
@@ -59,6 +60,10 @@ UID_SUFFIXES: Final = ("_uid", "-uid")
 
 #: Written directly beneath the title, with no heading of its own.
 DESCRIPTION_FIELD: Final = "description"
+
+#: Holds category uids in the recipe, and category names in the file; see
+#: `categories`.
+CATEGORIES_FIELD: Final = "categories"
 
 #: Written as an image embed between the title and the description, holding
 #: the filename of the recipe's photo inside `attachments/`.
@@ -172,14 +177,23 @@ class DocumentFormat:
     A prefixed field we do not recognise is kept as the user's too, rather
     than discarded: it costs nothing and it means a file written by a later
     version of this program loses nothing by being read by an earlier one.
+
+    `categories` is the account's list of category names, which lets the
+    file spell a recipe's categories by name while the recipe itself holds
+    their uids.  With no list -- an archive, which already holds names, or a
+    directory that has never pulled one -- values pass through as they are.
     """
 
     frontmatter_prefix: str = ""
+    categories: CategoryNames = field(default_factory=CategoryNames)
 
     def render(self, recipe: BaseRecipe, extras: Extras | None = None) -> str:
         """Render a recipe as a markdown document with YAML frontmatter."""
         extras = extras if extras is not None else Extras()
         data = recipe.as_dict()
+
+        if isinstance(data.get(CATEGORIES_FIELD), list):
+            data[CATEGORIES_FIELD] = self.categories.display_all(data[CATEGORIES_FIELD])
 
         frontmatter: dict[str, Any] = dict(extras.frontmatter)
         frontmatter.update(
@@ -211,6 +225,9 @@ class DocumentFormat:
 
         data: dict[str, Any] = dict(ours)
         data.update(fields)
+
+        if isinstance(data.get(CATEGORIES_FIELD), list):
+            data[CATEGORIES_FIELD] = self.categories.resolve_all(data[CATEGORIES_FIELD])
 
         # A file that does not name a uid does not have one.  Without this the
         # dataclass's default would invent a *different* uid every time the

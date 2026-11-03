@@ -7,6 +7,7 @@ the server.
     <root>/
         .paprika/
             config.yaml             -- which account this directory belongs to
+            categories.json         -- the account's category names, by uid
             recipes/<uid>.json      -- the recipe as last pulled ("the base")
             photos/<uid>.json       -- which photo we last downloaded, and
                                        a digest of the bytes we wrote
@@ -45,6 +46,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Final, TypeVar
 
+from .categories import CategoryNames
 from .constants import DEFAULT_DOMAIN
 from .exceptions import PaprikaProgrammingError, PaprikaUserError
 from .ignore import IGNORE_FILENAME, IgnoreRules
@@ -68,6 +70,7 @@ REPOSITORY_DIRNAME: Final = ".paprika"
 BASE_DIRNAME: Final = "recipes"
 PHOTOS_DIRNAME: Final = "photos"
 CONFIG_FILENAME: Final = "config.yaml"
+CATEGORIES_FILENAME: Final = "categories.json"
 RECIPE_SUFFIX: Final = ".md"
 
 #: Characters we refuse to put in a filename.  Paprika itself is happy with
@@ -278,6 +281,10 @@ class Repository:
     def config_path(self) -> Path:
         return self.repository_dir / CONFIG_FILENAME
 
+    @property
+    def categories_path(self) -> Path:
+        return self.repository_dir / CATEGORIES_FILENAME
+
     # -- Configuration ------------------------------------------------------
 
     @property
@@ -302,9 +309,62 @@ class Repository:
     def format(self) -> DocumentFormat:
         """How this directory's files are spelled; see `DocumentFormat`."""
         if self._format is None:
-            self._format = DocumentFormat(self.config.frontmatter_prefix)
+            self._format = DocumentFormat(
+                self.config.frontmatter_prefix, self.categories
+            )
 
         return self._format
+
+    @property
+    def categories(self) -> CategoryNames:
+        """The account's category names, as of the last sync."""
+        return CategoryNames.load(self.categories_path)
+
+    def update_categories(self, categories: CategoryNames) -> list[Path]:
+        """Adopt a fresh list of category names; return the files rewritten.
+
+        Recipes hold category uids, and only their files spell them as
+        names, so a category renamed in the app changes nothing about any
+        recipe -- but every file naming it is now spelled wrong.  Left alone,
+        each would read back with a name we no longer know, and so look like
+        an edit.  Those files are rewritten here, spelling for spelling, before
+        anything else reads them: each one is read with the names it was
+        written with and written back with the new ones, so the recipe it
+        holds, local edits and all, is exactly what it was.
+        """
+        old = self.format
+        new = replace(old, categories=categories)
+
+        if old.categories == categories:
+            return []
+
+        rewritten = []
+
+        for path in self.working_paths():
+            with open(path, encoding="utf-8") as inf:
+                content = inf.read()
+
+            try:
+                recipe, extras = old.parse(content, RemoteRecipe)
+            except PaprikaUserError:
+                # Whatever is wrong with it, the command about to read it will
+                # say so; renaming a category is no reason to touch it.
+                continue
+
+            if old.categories.display_all(
+                recipe.categories
+            ) == new.categories.display_all(recipe.categories):
+                continue
+
+            with open(path, "w", encoding="utf-8") as outf:
+                outf.write(new.render(recipe, extras))
+
+            rewritten.append(path)
+
+        categories.save(self.categories_path)
+        self._format = None
+
+        return rewritten
 
     @property
     def ignore(self) -> IgnoreRules:
