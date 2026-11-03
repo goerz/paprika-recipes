@@ -126,6 +126,7 @@ Write a markdown file with a `# Title`, and `push` will create it in Paprika. Th
 | `push` | Send local changes up: edits, new recipe files, photo changes, and deletions (into Paprika's trash). |
 | `status` | Show what `push` would do without doing it. `--exit-code` makes it exit 1 when there are changes, after `git diff --exit-code`. |
 | `restore <recipe>...` | Put recipes back the way they last arrived -- undoing an edit, or bringing back a deleted file. `--all` restores everything at once. |
+| `views` | Rebuild `views/`, a folder of symlinks for browsing the recipes by category, favorites, pinned, rating, and photos; see [Browsing by category](#browsing-by-category). Works offline. |
 
 `pull` and `push` both take `--dry-run`, and every command takes `--json` ([see Scripting](#scripting)). Two further commands work on exported archives rather than an account, and have [a section of their own](#working-with-exported-archives).
 
@@ -256,6 +257,23 @@ Paprika's sync API refers to a recipe's categories by uid, but the files spell t
 - A category the list no longer knows (one deleted in the app), and a name two categories share (possible when categories are nested), are written as the uid instead, so nothing is lost.
 
 A recipe can be in any number of categories. Folders don't represent them: you can sort files into folders however you like, but Paprika never sees the folders.
+
+### Browsing by category
+
+The directory stays flat, since a recipe can be in several categories and Paprika never sees folders. For browsing in a file manager, `paprika-recipes views` builds a separate tree of symlinks:
+
+```
+views/
+├── Dinners/            one folder per category, each recipe linked into all of its own
+├── Uncategorized/
+├── Favorites/
+├── Pinned/
+├── Top Rated/          links named "5★ Beef Stew.md", so they sort by rating
+└── Photos/
+    └── Tzatziki/       "1 Tzaziki.jpg", "2 Original Recipe.jpg": the gallery in order
+```
+
+Each recipe folder also links `attachments/`, so photos render when a recipe is opened through a view. The tree is derived from the files alone, so the command deletes and rebuilds it every time (only ever a folder it made itself). Add `views/` to `.paprikaignore` first, or the linked recipes would read as second copies; the command refuses to run until you have. `--output` builds it somewhere else inside the directory, and running it from a git `post-commit` hook keeps it current.
 
 ## Working with exported archives
 

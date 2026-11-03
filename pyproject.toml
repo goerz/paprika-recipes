@@ -46,6 +46,7 @@ status = "paprika_recipes.commands.status:Command"
 restore = "paprika_recipes.commands.restore:Command"
 extract-archive = "paprika_recipes.commands.extract_archive:Command"
 create-archive = "paprika_recipes.commands.create_archive:Command"
+views = "paprika_recipes.commands.views:Command"
 
 [tool.setuptools]
 packages = ["paprika_recipes", "paprika_recipes.commands"]
