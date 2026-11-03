@@ -215,6 +215,21 @@ Every field Paprika owns is then written as `paprika_rating:`, `paprika_uid:` an
 
 The prefix is chosen when you clone and cannot be changed afterwards without rewriting every file, so decide at the start. If the two ever do get out of step — a plugin that prunes frontmatter it does not recognise, say — `push` will notice that your files have stopped being identifiable and refuse to do anything, rather than treating them as new recipes and your existing ones as deleted.
 
+### Markdown that isn't a recipe
+
+Every `.md` file in the directory is a recipe, which is what lets a file you write from scratch become one. If the directory also holds markdown that is *not* a recipe -- a `README.md`, a `CLAUDE.md` of instructions for an assistant, a folder of drafts -- list it in a `.paprikaignore` file at the top of the directory:
+
+```gitignore
+README.md
+CLAUDE.md
+drafts/
+/notes/*.md
+```
+
+The syntax is a small subset of `.gitignore`'s. A name with no `/` matches at any depth, a pattern with a `/` is anchored to the top of the directory, a trailing `/` matches only directories (and everything inside them), and `**` matches any number of directories. Lines starting with `#` are comments. Negated `!` patterns are not supported, and are refused rather than silently skipped.
+
+Ignored files are invisible to every command: `status` doesn't list them, `push` never uploads them, `pull` never writes a recipe to an ignored name, and `create-archive` leaves them out. The one thing an ignore rule can't do is hide a recipe that is already tracked: that would make it look deleted, and `push` would move it to Paprika's trash, so any command that finds a tracked recipe behind an ignore rule stops and says so.
+
 ### Recipe files
 
 The format is markdown with YAML frontmatter. The prose -- description, ingredients, directions, notes, nutritional information -- is passed through exactly as Paprika stores it, and everything else lives in the frontmatter.

@@ -47,6 +47,7 @@ from typing import Any, Final, TypeVar
 
 from .constants import DEFAULT_DOMAIN
 from .exceptions import PaprikaProgrammingError, PaprikaUserError
+from .ignore import IGNORE_FILENAME, IgnoreRules
 from .markdown import (
     ATTACHMENTS_DIRNAME,
     PHOTO_FIELD,
@@ -305,6 +306,16 @@ class Repository:
 
         return self._format
 
+    @property
+    def ignore(self) -> IgnoreRules:
+        """Which markdown files here are not recipes; see `ignore`.
+
+        Read afresh every time rather than cached: the file is a few lines
+        long, and a stale copy could let a recipe be written to a name that
+        has since been excluded.
+        """
+        return IgnoreRules.load(self._root)
+
     # -- The base (pristine) copies -----------------------------------------
 
     def base_path_for(self, uid: str) -> Path:
@@ -456,7 +467,7 @@ class Repository:
     # -- The working directory ----------------------------------------------
 
     def working_paths(self) -> Iterator[Path]:
-        yield from recipe_files(self._root)
+        yield from recipe_files(self._root, self.ignore)
 
     def read_working(self, path: Path) -> RemoteRecipe:
         return read_recipe(path, RemoteRecipe, self.format)
@@ -571,7 +582,10 @@ class Repository:
             return existing[recipe.uid]
 
         return unique_path(
-            self._root, recipe, {path.resolve() for path in existing.values()}
+            self._root,
+            recipe,
+            {path.resolve() for path in existing.values()},
+            self.ignore,
         )
 
     def scan(self) -> tuple[dict[str, Path], list[Path]]:
@@ -635,6 +649,38 @@ class Repository:
 
         return replace(entry, uid=recipe.uid, recipe=recipe)
 
+    def _refuse_ignored_recipes(self, missing: set[str]) -> None:
+        """Stop before an ignore rule makes a tracked recipe look deleted.
+
+        A recipe whose file is matched by `.paprikaignore` is invisible to
+        `scan`, so from in here it looks exactly like a file the user deleted
+        -- and `push` would move it into Paprika's trash.  Adding an ignore
+        pattern should never do that, so an ignored file that carries the
+        uid of a recipe we are missing is refused instead.
+        """
+        if not missing:
+            return
+
+        ignore = self.ignore
+
+        for path in markdown_files(self._root):
+            if not ignore.ignores(path.relative_to(self._root)):
+                continue
+
+            try:
+                uid = self.read_working(path).uid
+            except PaprikaUserError:
+                # Not something we could have written; plainly not a recipe.
+                continue
+
+            if uid in missing:
+                raise PaprikaUserError(
+                    f"{path} is the recipe {uid}, but {IGNORE_FILENAME} "
+                    "excludes it, which would make it look deleted. Move the "
+                    "file somewhere that is not ignored, or change the "
+                    "pattern that matches it."
+                )
+
     # -- Change detection ---------------------------------------------------
 
     def is_modified(self, uid: str, path: Path) -> bool:
@@ -662,6 +708,8 @@ class Repository:
     def status(self) -> list[WorkingRecipe]:
         paths, untracked = self.scan()
         base_uids = self.base_uids()
+
+        self._refuse_ignored_recipes(base_uids - set(paths))
 
         result: list[WorkingRecipe] = []
 
@@ -722,13 +770,30 @@ class Repository:
         return result
 
 
-def recipe_files(root: Path) -> Iterator[Path]:
-    """Every recipe file under `root`, ignoring our own bookkeeping."""
+def recipe_files(root: Path, ignore: IgnoreRules | None = None) -> Iterator[Path]:
+    """Every recipe file under `root`, skipping our bookkeeping and ignored files.
+
+    `ignore` defaults to whatever `root`'s own `.paprikaignore` says.
+    """
+    for path in markdown_files(root):
+        if not _ignored(root, path, ignore):
+            yield path
+
+
+def markdown_files(root: Path) -> Iterator[Path]:
+    """Every markdown file under `root` except our own bookkeeping."""
     for path in sorted(root.rglob(f"*{RECIPE_SUFFIX}")):
-        if REPOSITORY_DIRNAME in path.parts:
+        if REPOSITORY_DIRNAME in path.relative_to(root).parts:
             continue
 
         yield path
+
+
+def _ignored(root: Path, path: Path, ignore: IgnoreRules | None = None) -> bool:
+    if ignore is None:
+        ignore = IgnoreRules.load(root)
+
+    return ignore.ignores(path.relative_to(root))
 
 
 def read_recipe(
@@ -747,22 +812,53 @@ def read_recipe(
         raise PaprikaUserError(f"{path}: {e}")
 
 
-def unique_path(root: Path, recipe: BaseRecipe, taken: Container[Path]) -> Path:
-    """Choose a file for a recipe, avoiding names already spoken for."""
+def unique_path(
+    root: Path,
+    recipe: BaseRecipe,
+    taken: Container[Path],
+    ignore: IgnoreRules | None = None,
+) -> Path:
+    """Choose a file for a recipe, avoiding names already spoken for.
+
+    A name the directory's `.paprikaignore` excludes is spoken for too: a
+    recipe written there would be invisible to the next `status`, which would
+    then report it deleted and have `push` move it into Paprika's trash.
+    """
+    if ignore is None:
+        ignore = IgnoreRules.load(root)
+
     # A recipe with neither a name nor a uid has nothing to be called; that
     # only happens for a file someone wrote and left blank, which is theirs
     # to name rather than ours.
     stem = safe_filename(recipe.name) or recipe.uid or "Untitled"
 
-    candidate = root / f"{stem}{RECIPE_SUFFIX}"
-    if candidate.resolve() not in taken and not candidate.exists():
-        return candidate
-
     # Two different recipes can share a name; fall back to disambiguating
     # with a slice of the uid, which is unique by construction.
     suffix = recipe.uid.split("-")[0] or uuid.uuid4().hex[:8]
 
-    return root / f"{stem} ({suffix}){RECIPE_SUFFIX}"
+    candidates = [
+        root / f"{stem}{RECIPE_SUFFIX}",
+        root / f"{stem} ({suffix}){RECIPE_SUFFIX}",
+        root / f"{recipe.uid or uuid.uuid4().hex}{RECIPE_SUFFIX}",
+    ]
+
+    for candidate in candidates:
+        if ignore.ignores(candidate.relative_to(root)):
+            continue
+
+        if candidate.resolve() not in taken and not candidate.exists():
+            return candidate
+
+    # Everything is taken; the disambiguated name is what we always fell
+    # back to before there were ignore rules, so it stays the first choice.
+    for candidate in (*candidates[1:], candidates[0]):
+        if not ignore.ignores(candidate.relative_to(root)):
+            return candidate
+
+    raise PaprikaUserError(
+        f"Every file name we could give {recipe.name or recipe.uid!r} is "
+        f"excluded by {root / IGNORE_FILENAME}."
+    )
 
 
 def safe_filename(name: str) -> str:
