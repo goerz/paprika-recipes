@@ -576,12 +576,19 @@ class Syncer:
             return ""
 
         # A change to nothing but the gallery leaves the recipe itself alone.
-        recipe_changed = entry.status is Status.ADDED or bool(
+        is_new = entry.status is Status.ADDED
+        recipe_changed = is_new or bool(
             set(entry.changed_fields()) - {GALLERY_FIELD}
         )
 
         if not dry_run:
             self._notify(name)
+
+            # Paprika refuses a gallery photo for a recipe it doesn't know, so
+            # a new recipe goes up first.  An existing one goes up after its
+            # photos, so that it never names a picture the server lacks.
+            if is_new:
+                self._remote.upload_recipe(plan.upload, photo_upload=plan.thumbnail)
 
             for photo, image in gallery.uploads:
                 self._remote.upload_photo(photo, image)
@@ -589,7 +596,7 @@ class Syncer:
             if plan.gallery is not None:
                 self._remote.upload_photo(*plan.gallery)
 
-            if recipe_changed:
+            if recipe_changed and not is_new:
                 self._remote.upload_recipe(plan.upload, photo_upload=plan.thumbnail)
 
             for photo in gallery.deletions:

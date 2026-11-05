@@ -87,6 +87,10 @@ class FakeAccount:
         )
 
     def upload_photo(self, photo: RemotePhoto, image: bytes | None = None) -> None:
+        if photo.recipe_uid not in self.recipes:
+            # Paprika's own wording, seen against the real account.
+            raise RequestError("Photo uploaded for a recipe which no longer exists.")
+
         if image is not None:
             url = f"https://photos.example/{photo.filename}"
             self.photos[url] = image
@@ -1210,6 +1214,29 @@ class TestPushingANewPhoto:
         )
         assert created["photo"].endswith(".jpg")
         assert f"https://photos.example/{created['photo']}" in account.photos
+
+    def test_a_hand_written_recipe_brings_its_gallery_along(self, repository, account):
+        Syncer(repository, account).pull()
+        repository.attachments_dir.mkdir(exist_ok=True)
+        (repository.attachments_dir / "dinner.jpg").write_bytes(image_bytes())
+        (repository.attachments_dir / "card.jpg").write_bytes(image_bytes("blue"))
+        (repository.root / "Mine.md").write_text(
+            "---\ntags: [dinner]\n---\n\n# Mine\n\n"
+            "![my dinner](attachments/dinner.jpg)\n\n"
+            "## Ingredients\n\n- 1 tsp salt\n\n"
+            "## Photos\n\n- [Card](attachments/card.jpg)\n",
+            encoding="utf-8",
+        )
+
+        report = Syncer(repository, account).push()
+
+        assert actions(report)["Mine"] is Action.CREATED
+        uid = next(
+            uid for uid, data in account.recipes.items() if data["name"] == "Mine"
+        )
+        photos = [p for p in account.gallery.values() if p.recipe_uid == uid]
+        assert sorted(p.name for p in photos) == ["2", "Card"]
+        assert account.recipes[uid]["photo_large"] in {p.filename for p in photos}
 
     def test_a_missing_attachment_stops_only_that_recipe(self, repository, account):
         Syncer(repository, account).pull()
